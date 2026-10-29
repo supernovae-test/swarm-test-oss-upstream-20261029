@@ -1,0 +1,16 @@
+required_checks:
+  - name: greeting
+    command: test "$(cat hello.txt)" = 'hello from SwarmOS'
+    timeout: 30s
+protected_paths:
+  - .swarm/config.yaml
+  - .swarm/validation/**
+  - .swarm/prompts/**
+  - .swarm/workflows/**
+  - .swarm/contracts/**
+  - .swarm/rules/**
+  - .swarm/skills/**
+  - .github/**
+  - operator-fixtures/**
+  - AGENTS.md
+  - CLAUDE.md

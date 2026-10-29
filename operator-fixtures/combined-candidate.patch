@@ -1,0 +1,514 @@
+diff --git a/internal/fork/org_read_credential_integration_test.go b/internal/fork/org_read_credential_integration_test.go
+new file mode 100644
+index 0000000..c162bed
+--- /dev/null
++++ b/internal/fork/org_read_credential_integration_test.go
+@@ -0,0 +1,475 @@
++package fork
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/cli/go-gh/v2/pkg/api"
++	"github.com/supernovae/swarmos/internal/contract"
++	"github.com/supernovae/swarmos/internal/coordination"
++	"github.com/supernovae/swarmos/internal/harness"
++	"github.com/supernovae/swarmos/internal/lease"
++	"github.com/supernovae/swarmos/internal/testutil/gitfixture"
++	"github.com/supernovae/swarmos/internal/tracker"
++)
++
++// REST supplies evidence to the production verifier. Git below is a routing
++// double using local objects, and does not prove authenticated Git transport.
++type orgReadFixture struct {
++	edited, emptyReader                                                           bool
++	ledger                                                                        []string
++	t                                                                             *testing.T
++	coord                                                                         *Coordinator
++	state                                                                         *fakeGitHubState
++	root, origin, slug, head, permission, identity, source, canonical, gitFailure string
++	private, selected                                                             bool
++	status, forkReads, permissionReads, admission, writes                         int
++	results                                                                       []ForkResult
++	routes                                                                        []string
++}
++
++func newOrgReadFixture(t *testing.T, org, private, selected bool) *orgReadFixture {
++	t.Helper()
++	f := &orgReadFixture{t: t, private: private, selected: selected, permission: "write", identity: "alice", source: "octo/swarm", status: 200}
++	f.slug = "alice/swarm"
++	if org {
++		f.slug = "builders/swarm"
++	}
++	f.canonical = f.slug
++	tmp := t.TempDir()
++	f.origin = filepath.Join(tmp, "origin.git")
++	f.root = filepath.Join(tmp, "checkout")
++	f.git(tmp, "init", "--bare", "--initial-branch=main", f.origin)
++	f.git(tmp, "clone", f.origin, f.root)
++	if _, err := harness.InitRepository(harness.InitOptions{RepoRoot: f.root}); err != nil {
++		t.Fatal(err)
++	}
++	f.git(f.root, "add", ".")
++	f.git(f.root, "commit", "-m", "approved policy")
++	f.git(f.root, "push", "origin", "main")
++	f.head = f.git(f.root, "rev-parse", "HEAD")
++	f.state = newFakeGitHubState()
++	f.state.baseSHA = f.head
++	f.state.issues[42] = &tracker.Issue{Number: 42, Title: "Fork feature", State: "open", Author: "maintainer", Body: "```yaml swarm-workunit\nid: ISSUE-42\nobjective: Test fork\nconstraints: [Follow policy]\nacceptance: [Tests pass]\nworkflow: feature\ngate: agent\n```"}
++	cfg, err := harness.LoadConfigAt(f.root, f.head)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mgr := lease.NewManager(f.state.trackerForUser(t, "maintainer", "User"), cfg.Security)
++	if err = mgr.ConfigureStore(f.root); err != nil {
++		t.Fatal(err)
++	}
++	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
++	mgr.SetNowFunc(func() time.Time { return now })
++	if _, err = mgr.ApproveTask(context.Background(), 42, "maintainer"); err != nil {
++		t.Fatal(err)
++	}
++	transport := roundTripFunc(f.roundTrip)
++	client, err := api.NewRESTClient(api.ClientOptions{Host: "github.com", AuthToken: "synthetic-default", Transport: transport, LogIgnoreEnv: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.coord = &Coordinator{RepoRoot: f.root, UpstreamRepo: "octo/swarm", Tracker: tracker.NewGitHubTrackerWithClient("octo", "swarm", client), NowFn: func() time.Time { return now }}
++	t.Cleanup(func() {
++		if t.Failed() {
++			t.Logf("REST ledger: %v; Git routing: %v", f.ledger, f.routes)
++		}
++	})
++	old := http.DefaultTransport
++	http.DefaultTransport = transport
++	t.Cleanup(func() { http.DefaultTransport = old })
++	token := "synthetic-selected"
++	if !selected {
++		token = "synthetic-default"
++	}
++	reader, err := tracker.NewForkReader("octo/swarm", "github.com", token)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.coord.InitForkReader = func() (func(context.Context, string, string) (string, error), func(context.Context, string, string, string) (string, error), error) {
++		if f.emptyReader {
++			_, err := tracker.NewForkReader("octo/swarm", "github.com", "")
++			return nil, nil, err
++		}
++		return func(ctx context.Context, slug, actor string) (string, error) {
++				return reader.VerifyForkRepository(ctx, slug, actor, false)
++			}, func(_ context.Context, slug, op, value string) (string, error) {
++				f.routes = append(f.routes, slug+" "+op+" "+value)
++				if slug != f.slug {
++					t.Fatalf("wrong Git slug %s", slug)
++				}
++				if op == f.gitFailure {
++					return "", fmt.Errorf("synthetic Git denial")
++				}
++				switch op {
++				case "ls-remote":
++					return f.head + "\trefs/heads/" + value, nil
++				case "fetch":
++					if value != f.head {
++						t.Fatal("wrong fetch SHA")
++					}
++					return "", nil
++				default:
++					t.Fatalf("unexpected Git operation %s", op)
++				}
++				return "", nil
++			}, nil
++	}
++	return f
++}
++func (f *orgReadFixture) git(dir string, args ...string) string {
++	f.t.Helper()
++	out, err := gitfixture.Command(f.t, dir, args...).CombinedOutput()
++	if err != nil {
++		f.t.Fatalf("git %v: %v %s", args, err, out)
++	}
++	return strings.TrimSpace(string(out))
++}
++func (f *orgReadFixture) roundTrip(r *http.Request) (*http.Response, error) {
++	f.ledger = append(f.ledger, r.Method+" "+r.URL.Host+r.URL.RequestURI()+" "+r.Header.Get("Authorization"))
++	if r.URL.Host != "api.github.com" {
++		f.t.Fatalf("unexpected host %s", r.URL.Host)
++	}
++	rec := httptest.NewRecorder()
++	rec.Header().Set("Content-Type", "application/json")
++	write := func(v any) {
++		if err := json.NewEncoder(rec).Encode(v); err != nil {
++			f.t.Fatal(err)
++		}
++	}
++	fork := r.URL.Path == "/repos/"+f.slug || strings.HasPrefix(r.URL.Path, "/repos/"+f.slug+"/collaborators/")
++	token := "token synthetic-default"
++	if fork && f.selected {
++		token = "token synthetic-selected"
++	}
++	if r.Header.Get("Authorization") != token {
++		f.t.Fatalf("wrong credential for %s %s", r.Method, r.URL.Path)
++	}
++	if fork {
++		if r.Method != "GET" {
++			f.t.Fatal("fork mutation")
++		}
++		if strings.Contains(r.URL.Path, "/collaborators/") {
++			if r.URL.Path != "/repos/"+f.slug+"/collaborators/alice/permission" {
++				f.t.Fatalf("wrong permission route %s", r.URL.Path)
++			}
++			f.permissionReads++
++			write(map[string]any{"permission": f.permission, "user": map[string]string{"login": f.identity}})
++		} else {
++			f.forkReads++
++			if f.status != 200 {
++				rec.WriteHeader(f.status)
++				write(map[string]string{"message": "synthetic denial"})
++			} else {
++				owner, _, _ := strings.Cut(f.slug, "/")
++				typ := "User"
++				if owner == "builders" {
++					typ = "Organization"
++				}
++				write(map[string]any{"full_name": f.canonical, "name": "swarm", "fork": true, "private": f.private, "owner": map[string]string{"login": owner, "type": typ}, "source": map[string]string{"full_name": f.source}, "permissions": map[string]bool{"admin": true, "push": true}})
++			}
++		}
++	} else {
++		if r.Method == "GET" {
++			f.admission++
++		} else if r.Method == "POST" && r.URL.Path == "/repos/octo/swarm/issues/42/comments" {
++			var body struct{ Body string }
++			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++				f.t.Fatal(err)
++			}
++			if strings.HasPrefix(body.Body, ResultMarker) {
++				res, err := ParseResultComment(body.Body)
++				if err != nil {
++					f.t.Fatal(err)
++				}
++				f.results = append(f.results, *res)
++			} else {
++				f.writes++
++			}
++			write(map[string]any{"id": 900 + len(f.results)})
++			resp := rec.Result()
++			resp.Request = r
++			return resp, nil
++		} else if (r.Method == "POST" && r.URL.Path == "/repos/octo/swarm/issues/42/labels") || (r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/repos/octo/swarm/issues/42/labels/")) {
++			f.writes++
++			write(map[string]any{})
++			resp := rec.Result()
++			resp.Request = r
++			return resp, nil
++		} else {
++			f.writes++
++			f.t.Fatalf("unexpected upstream mutation %s %s", r.Method, r.URL.Path)
++		}
++		switch r.URL.Path {
++		case "/repos/octo/swarm/issues/42/comments":
++			write([]any{})
++		case "/repos/octo/swarm/issues/42":
++			iss := f.state.issues[42]
++			write(map[string]any{"number": 42, "title": iss.Title, "body": iss.Body, "state": "open", "labels": []map[string]string{{"name": "swarm:ready"}}, "user": map[string]string{"login": "maintainer"}})
++		case fmt.Sprintf("/repos/octo/swarm/issues/comments/%d", f.state.comments[700].ID):
++			c := f.state.comments[700]
++			write(map[string]any{"id": c.ID, "body": c.Body, "created_at": c.CreatedAt, "updated_at": c.UpdatedAt, "user": map[string]string{"login": c.Author, "type": "User"}})
++		default:
++			f.t.Fatalf("unexpected admission route %s %s", r.Method, r.URL.Path)
++		}
++	}
++	resp := rec.Result()
++	resp.Request = r
++	return resp, nil
++}
++func (f *orgReadFixture) apply(req lease.ForkRequest) (*ForkResult, error) {
++	req.Version = 1
++	req.IssueNumber = 42
++	if req.Operation == "acquire" {
++		req.ForkRepo = f.slug
++		req.Agent = "claude"
++		req.Phase = "all"
++	}
++	body, err := FormatRequestComment(req)
++	if err != nil {
++		f.t.Fatal(err)
++	}
++	// Request IDs increase independently of the stable API route.
++	id := int64(700 + len(f.results))
++	now := f.coord.now()
++	c := &tracker.Comment{ID: id, Author: "alice", AuthorType: "User", Body: body, CreatedAt: now, UpdatedAt: now}
++	if f.edited {
++		c.UpdatedAt = now.Add(time.Second)
++	}
++	f.state.comments[700] = c
++	var ev IssueCommentEvent
++	ev.Action = "created"
++	ev.Repository.FullName = "octo/swarm"
++	ev.Issue.Number = 42
++	ev.Comment.ID = id
++	ev.Comment.Body = body
++	ev.Comment.User.Login = "alice"
++	ev.Comment.CreatedAt = now
++	ev.Comment.UpdatedAt = now
++	// The API comment path includes the request ID.
++	return f.coord.HandleEvent(context.Background(), ev)
++}
++func (f *orgReadFixture) authority() *lease.IssueState {
++	f.t.Helper()
++	cfg, err := harness.LoadConfig(f.root)
++	if err != nil {
++		f.t.Fatal(err)
++	}
++	layout, err := coordination.LayoutFor(cfg.LedgerNamespace)
++	if err != nil {
++		f.t.Fatal(err)
++	}
++	raw, _, err := coordination.NewGitStoreWithLayout(f.root, "origin", layout).Load(context.Background(), 42)
++	if err != nil {
++		f.t.Fatal(err)
++	}
++	var st lease.IssueState
++	if err = json.Unmarshal(raw, &st); err != nil {
++		f.t.Fatal(err)
++	}
++	return &st
++}
++func (f *orgReadFixture) snapshot() string {
++	// All authoritative remote refs include issue state and contributor index;
++	// object IDs bind their complete bytes, artifacts, checkpoints and PR state.
++	return f.git(f.origin, "for-each-ref", "--format=%(refname) %(objectname)")
++}
++func TestForkCoordinatorOrgReadCredentialLifecycle(t *testing.T) {
++	for _, org := range []bool{false, true} {
++		for _, private := range []bool{false, true} {
++			for _, selected := range []bool{false, true} {
++				t.Run(fmt.Sprintf("organization=%t/private=%t/selected=%t", org, private, selected), func(t *testing.T) {
++					f := newOrgReadFixture(t, org, private, selected)
++					if org && selected {
++						f.permission = "maintain"
++						if private {
++							f.permission = "admin"
++						}
++					}
++					res, err := f.apply(lease.ForkRequest{Operation: "acquire"})
++					if err != nil {
++						t.Fatal(err)
++					}
++					claim := res.ClaimID
++					st := f.authority()
++					if st.Lease.Owner != "alice" || st.ForkRepo != f.slug || st.Lease.ClaimID != claim {
++						t.Fatalf("incorrect authority %+v", st)
++					}
++					if claim == "" {
++						t.Fatal("empty claim")
++					}
++					for _, req := range []lease.ForkRequest{
++						{Operation: "renew", ClaimID: claim},
++						{Operation: "update-artifact", ClaimID: claim, Artifact: &contract.Artifact{Type: contract.ArtifactDesign, Producer: "claude:planner", Summary: "Plan", Body: "# Plan\n"}},
++						{Operation: "record-checkpoint", ClaimID: claim, Branch: "swarm/issue-42-" + claim, HeadSHA: f.head},
++						{Operation: "release", ClaimID: claim},
++					} {
++						if _, err = f.apply(req); err != nil {
++							t.Fatalf("%s: %v", req.Operation, err)
++						}
++						st = f.authority()
++						if req.Operation == "update-artifact" && len(st.Artifacts) == 0 {
++							t.Fatal("artifact not durable")
++						}
++						if req.Operation == "record-checkpoint" && (st.HeadSHA != f.head || st.Branch != req.Branch) {
++							t.Fatal("checkpoint not durable")
++						}
++
++					}
++					if f.forkReads != 5 || f.admission < 10 || len(f.results) != 5 || f.writes == 0 {
++						t.Fatalf("counts reads=%d admission=%d results=%d writes=%d", f.forkReads, f.admission, len(f.results), f.writes)
++					}
++					if org && f.permissionReads != 5 {
++						t.Fatalf("permissions %d", f.permissionReads)
++					}
++					want := []string{f.slug + " ls-remote swarm/issue-42-" + claim, f.slug + " fetch " + f.head}
++					if fmt.Sprint(f.routes) != fmt.Sprint(want) {
++						t.Fatalf("routes %v", f.routes)
++					}
++					for _, r := range f.results {
++						if !r.Success {
++							t.Fatalf("failed result %+v", r)
++						}
++					}
++				})
++			}
++		}
++	}
++}
++func TestForkCoordinatorOrgReadCredentialDenials(t *testing.T) {
++	cases := []string{"personal actor", "read", "triage", "none", "unknown", "missing identity", "wrong identity", "coordinator identity", "source", "canonical", "401", "403", "404", "private invisible", "revocation", "ls-remote", "fetch", "stale claim", "empty reader", "edited request"}
++	for _, name := range cases {
++		t.Run(name, func(t *testing.T) {
++			f := newOrgReadFixture(t, name != "personal actor", true, true)
++			req := lease.ForkRequest{Operation: "acquire"}
++			if name == "revocation" || name == "ls-remote" || name == "fetch" || name == "stale claim" {
++				res, err := f.apply(req)
++				if err != nil {
++					t.Fatal(err)
++				}
++				req = lease.ForkRequest{Operation: "renew", ClaimID: res.ClaimID}
++				if name == "ls-remote" || name == "fetch" {
++					req.Operation = "record-checkpoint"
++					req.Branch = "swarm/issue-42-" + res.ClaimID
++					req.HeadSHA = f.head
++					f.gitFailure = name
++				}
++				if name == "stale claim" {
++					req.ClaimID = "stale"
++				}
++			}
++			switch name {
++			case "empty reader":
++				f.emptyReader = true
++			case "edited request":
++				f.edited = true
++			case "personal actor":
++				f.slug = "bob/swarm"
++				f.canonical = f.slug
++			case "read", "triage", "none", "unknown":
++				f.permission = name
++			case "missing identity":
++				f.identity = ""
++			case "wrong identity":
++				f.identity = "bob"
++			case "coordinator identity":
++				f.identity = ActionsBotLogin
++			case "source":
++				f.source = "evil/swarm"
++			case "canonical":
++				f.canonical = "evil/swarm"
++			case "401":
++				f.status = 401
++			case "403":
++				f.status = 403
++			case "404":
++				f.status = 404
++			case "private invisible":
++				// Separate control probe proves default visibility before the denied
++				// selected-reader request. The request transport then forbids fallback.
++				f.selected = false
++				reader, err := tracker.NewForkReader("octo/swarm", "github.com", "synthetic-default")
++				if err != nil {
++					t.Fatal(err)
++				}
++				if _, err = reader.VerifyForkRepository(context.Background(), f.slug, "alice", false); err != nil {
++					t.Fatalf("default visibility control: %v", err)
++				}
++				f.selected = true
++				f.status = 404
++			case "revocation":
++				f.permission = "read"
++			}
++			before := f.snapshot()
++			n := len(f.results)
++			writes := f.writes
++			res, err := f.apply(req)
++			if err == nil {
++				t.Fatal("denial accepted")
++			}
++			if name == "stale claim" && !errors.Is(err, lease.ErrClaimFence) {
++				t.Fatalf("wrong fence error: %v", err)
++			}
++			if (name == "ls-remote" || name == "fetch") && !strings.Contains(err.Error(), "synthetic Git denial") {
++				t.Fatalf("did not reach Git denial: %v", err)
++			}
++			if name == "ls-remote" && len(f.routes) != 1 {
++				t.Fatalf("fallback after ls-remote: %v", f.routes)
++			}
++			if name == "fetch" && len(f.routes) != 2 {
++				t.Fatalf("fetch routing: %v", f.routes)
++			}
++			if f.snapshot() != before || f.writes != writes {
++				t.Fatal("denial changed authority")
++			}
++			if name == "empty reader" || name == "edited request" {
++				if len(f.results) != n || res != nil || f.forkReads != 0 {
++					t.Fatal("early rejection executed or posted result")
++				}
++				return
++			}
++			if len(f.results) != n+1 || res == nil {
++				t.Fatalf("result count %d", len(f.results)-n)
++			}
++			r := f.results[n]
++			if r.Success || r.Error == "" || r.Error != err.Error() || r.RequestID != int64(700+n) || r.IssueNumber != 42 || r.Operation != req.Operation {
++				t.Fatalf("unbound failure %+v", r)
++			}
++		})
++	}
++	for _, name := range []string{"non-bot", "edited", "mismatched"} {
++		t.Run("forged result/"+name, func(t *testing.T) {
++			f := newOrgReadFixture(t, true, true, true)
++			before := f.snapshot()
++			now := time.Now()
++			r := ForkResult{Version: 1, RequestID: 100, IssueNumber: 42, Operation: "acquire", Success: true, ClaimID: "forged"}
++			c := &tracker.Comment{ID: 101, Author: ActionsBotLogin, AuthorType: "Bot", CreatedAt: now, UpdatedAt: now}
++			switch name {
++			case "non-bot":
++				c.Author = "alice"
++				c.AuthorType = "User"
++			case "edited":
++				c.UpdatedAt = now.Add(time.Second)
++			case "mismatched":
++				r.Operation = "release"
++			}
++			c.Body, _ = FormatResultComment(r)
++			tr := &pollingTracker{list: func(context.Context) ([]*tracker.Comment, error) { return []*tracker.Comment{c}, nil }}
++			g := &Gateway{Tracker: tr, Store: emptyPollingStore{}, ForkRepo: f.slug, PollTimeout: 20 * time.Millisecond, PollInterval: time.Millisecond}
++			if _, err := g.Apply(context.Background(), lease.ForkRequest{Version: 1, IssueNumber: 42, Operation: "acquire"}); !errors.Is(err, context.DeadlineExceeded) || tr.calls == 0 {
++				t.Fatalf("forged outcome accepted or polling absent: %v", err)
++			}
++			if f.snapshot() != before || len(f.results) != 0 || f.writes != 0 {
++				t.Fatal("forged result changed authority")
++			}
++		})
++	}
++}
+diff --git a/internal/tracker/github_test.go b/internal/tracker/github_test.go
+index a467579..e1cc263 100644
+--- a/internal/tracker/github_test.go
++++ b/internal/tracker/github_test.go
+@@ -656,7 +656,6 @@ func TestLocalListSubIssues(t *testing.T) {
+ 	assertOrder(a.Number, b.Number, c.Number)
+ }
+ 
+-<<<<<<< HEAD
+ func TestForkOrganizationActorEvidence(t *testing.T) {
+ 	for _, private := range []bool{false, true} {
+ 		for _, requirePush := range []bool{false, true} {
+@@ -809,7 +808,11 @@ func TestForkOrganizationRejectsForgedMetadata(t *testing.T) {
+ 			}))
+ 			if _, err := tr.VerifyForkRepository(context.Background(), tc.slug, "alice", false); err == nil {
+ 				t.Fatal("accepted forged metadata")
+-=======
++			}
++		})
++	}
++}
++
+ func TestSelectedForkReaderAuthAndDenials(t *testing.T) {
+ 	for _, status := range []int{200, 401, 403, 404} {
+ 		t.Run(fmt.Sprint(status), func(t *testing.T) {
+@@ -849,7 +852,6 @@ func TestSelectedForkReaderAuthAndDenials(t *testing.T) {
+ 			}
+ 			if calls != 1 {
+ 				t.Fatal("invalid operation made request")
+->>>>>>> f91333f29daf4ed657c48d017b5a56b49e547fcb
+ 			}
+ 		})
+ 	}

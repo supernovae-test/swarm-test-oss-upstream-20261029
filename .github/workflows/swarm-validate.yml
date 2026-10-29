@@ -1,0 +1,127 @@
+name: SwarmOS Validation
+
+on:
+  pull_request:
+  push:
+    branches: ['main']
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: swarm-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Install pinned SwarmOS validator
+        env:
+          SWARM_VERSION: f139106bed6e58d4c1e84f1aafca8bd27510fc1b
+          GOBIN: ${{ runner.temp }}/swarm-bin
+        working-directory: ${{ runner.temp }}
+        run: go install github.com/supernovae/swarmos/cmd/swarm@"$SWARM_VERSION"
+      # Maintainers may change protected policy in their own pull requests; the
+      # check lists those files instead of failing. Agent branches (swarm/...),
+      # fork heads, and other authors keep strict enforcement.
+      - name: Decide protected-path handling
+        id: protected
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          mode=enforce
+          issue=
+          case "$HEAD_REF" in
+            swarm/*)
+              # A same-repository issue branch names the issue whose approved
+              # state the trusted validator checks. The name grants nothing.
+              if [ "$HEAD_REPO" = "$REPO" ]; then
+                case "$HEAD_REF" in
+                  swarm/issue-[0-9]*-*) issue=${HEAD_REF#swarm/issue-}; issue=${issue%%-*} ;;
+                esac
+                case "$issue" in *[!0-9]*) issue= ;; esac
+              fi
+              ;;
+            *)
+              if [ "$HEAD_REPO" = "$REPO" ]; then
+                permission=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission 2>/dev/null || true)
+                case "$permission" in admin|maintain|write) mode=report ;; esac
+              fi
+              ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "issue=$issue" >> "$GITHUB_OUTPUT"
+      # This step holds a token, so it runs only the trusted validator, never
+      # candidate code: it checks the linked issue's authoritative approved
+      # state and records the verified grant for the validate step.
+      - name: Verify approved harness grant
+        if: steps.protected.outputs.issue != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINKED_ISSUE: ${{ steps.protected.outputs.issue }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          swarm="$RUNNER_TEMP/swarm-bin/swarm"
+          grant="$RUNNER_TEMP/swarm-harness-grant.json"
+          rm -f "$grant"
+          if ! "$swarm" repo validate --help | grep -q -- '--grant-only'; then
+            echo "::notice::The validator at the trusted base predates approved harness grants; protected paths stay enforced."
+            exit 0
+          fi
+          if ! git rev-parse -q --verify HEAD^2 >/dev/null; then
+            exit 0
+          fi
+          "$swarm" repo validate --base "$(git rev-parse HEAD^1)" --issue "$LINKED_ISSUE" --pr "$PR_NUMBER" --grant-only --grant-file "$grant"
+      # Runtime setup may run candidate code (dependency installs), so it
+      # comes after every step that holds a token.
+      # No language runtime was detected; add setup steps here if your required checks need one.
+
+      # Check commands come from the trusted base, never the candidate's policy.
+      - name: Validate against trusted base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PROTECTED_MODE: ${{ steps.protected.outputs.mode || 'enforce' }}
+        run: |
+          # Pull requests check out GitHub's merge commit. Its first parent is the
+          # target branch commit it merged into; the event's base SHA can lag
+          # behind it, which would count newer target commits as PR changes.
+          if [ "$EVENT_NAME" = pull_request ] && git rev-parse -q --verify HEAD^2 >/dev/null; then
+            BASE_SHA=$(git rev-parse HEAD^1)
+          fi
+          # A push to the default branch is trusted policy, including harness
+          # upgrades maintainers commit there; check it against its own policy.
+          if [ "$EVENT_NAME" = push ]; then
+            BASE_SHA=$(git rev-parse HEAD)
+          fi
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            echo 'No trusted base: bootstrap and review the harness before enabling this workflow.' >&2
+            exit 1
+          fi
+          set --
+          if [ -f "$RUNNER_TEMP/swarm-harness-grant.json" ]; then
+            set -- --grant-file "$RUNNER_TEMP/swarm-harness-grant.json"
+          fi
+          status=0
+          "$RUNNER_TEMP/swarm-bin/swarm" repo validate --base "$BASE_SHA" --protected-paths "${PROTECTED_MODE:-enforce}" "$@" > "$RUNNER_TEMP/swarm-validate.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/swarm-validate.txt"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            { echo '### SwarmOS validation'; echo '```text'; cat "$RUNNER_TEMP/swarm-validate.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"

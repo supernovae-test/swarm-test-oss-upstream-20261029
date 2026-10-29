@@ -1,0 +1,7 @@
+.swarm/worktrees/
+.swarm/active/
+.swarm/local/
+.swarm/locks/
+# SwarmOS ephemeral state
+.swarm/local-tracker/
+.swarm/coordination/
